@@ -1,12 +1,12 @@
-FROM lambci/lambda-base
+FROM justinram11/lambda-base
 
 RUN curl https://lambci.s3.amazonaws.com/fs/nodejs10.x.tgz | tar -zx -C /opt
 
 
-FROM lambci/lambda:provided
+FROM justinram11/lambda:provided
 
 
-FROM lambci/lambda-base-2
+FROM justinram11/lambda-base-2
 
 ENV PATH=/var/lang/bin:$PATH \
     LD_LIBRARY_PATH=/var/lang/lib:$LD_LIBRARY_PATH \

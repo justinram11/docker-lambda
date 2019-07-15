@@ -6,7 +6,7 @@ COPY init.go ./
 RUN GOARCH=amd64 GOOS=linux go build init.go
 
 
-FROM lambci/lambda-base
+FROM justinram11/lambda-base
 
 COPY --from=0 /app/init /var/runtime/init
 

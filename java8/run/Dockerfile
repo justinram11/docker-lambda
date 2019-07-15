@@ -4,7 +4,7 @@ COPY ./lambda-runtime-mock /src
 RUN apk add --no-cache curl && ./build.sh
 
 
-FROM lambci/lambda-base
+FROM justinram11/lambda-base
 
 ENV AWS_EXECUTION_ENV=AWS_Lambda_java8
 

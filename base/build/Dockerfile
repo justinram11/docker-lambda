@@ -1,4 +1,4 @@
-FROM lambci/lambda-base
+FROM justinram11/lambda-base
 
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin
 

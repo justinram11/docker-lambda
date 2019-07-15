@@ -1,4 +1,4 @@
-FROM lambci/lambda-base:build
+FROM justinram11/lambda-base:build
 
 ENV GOLANG_VERSION=1.12 \
     GOPATH=/go \

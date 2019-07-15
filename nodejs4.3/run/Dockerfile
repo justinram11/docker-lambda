@@ -1,4 +1,4 @@
-FROM lambci/lambda-base
+FROM justinram11/lambda-base
 
 ENV PATH=/usr/local/lib64/node-v4.3.x/bin:$PATH \
     LD_LIBRARY_PATH=/usr/local/lib64/node-v4.3.x/lib:$LD_LIBRARY_PATH \

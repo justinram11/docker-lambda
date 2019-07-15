@@ -6,7 +6,7 @@ RUN dep ensure
 RUN GOARCH=amd64 GOOS=linux go build aws-lambda-mock.go
 
 
-FROM lambci/lambda-base
+FROM justinram11/lambda-base
 
 ENV AWS_EXECUTION_ENV=AWS_Lambda_go1.x
 

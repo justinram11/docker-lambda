@@ -1,7 +1,7 @@
-FROM lambci/lambda:provided
+FROM justinram11/lambda:provided
 
 
-FROM lambci/lambda-base
+FROM justinram11/lambda-base
 
 ENV PATH=/var/lang/bin:$PATH \
     LD_LIBRARY_PATH=/var/lang/lib:$LD_LIBRARY_PATH \

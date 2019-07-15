@@ -1,4 +1,4 @@
-FROM lambci/lambda-base:build
+FROM justinram11/lambda-base:build
 
 # Add these as a separate layer as they get updated frequently
 RUN curl --silent --show-error --retry 5 https://bootstrap.pypa.io/get-pip.py | python && \

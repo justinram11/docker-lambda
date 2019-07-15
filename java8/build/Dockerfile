@@ -1,4 +1,4 @@
-FROM lambci/lambda-base:build
+FROM justinram11/lambda-base:build
 
 ENV AWS_EXECUTION_ENV=AWS_Lambda_java8
 

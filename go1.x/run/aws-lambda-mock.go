@@ -67,8 +67,8 @@ func main() {
 	}
 	mockContext.ParseTimeout()
 
-	awsAccessKey := getEnv("AWS_ACCESS_KEY", getEnv("AWS_ACCESS_KEY_ID", "SOME_ACCESS_KEY_ID"))
-	awsSecretKey := getEnv("AWS_SECRET_KEY", getEnv("AWS_SECRET_ACCESS_KEY", "SOME_SECRET_ACCESS_KEY"))
+	awsAccessKey := getEnv("AWS_ACCESS_KEY", os.Getenv("AWS_ACCESS_KEY_ID"))
+	awsSecretKey := getEnv("AWS_SECRET_KEY", os.Getenv("AWS_SECRET_ACCESS_KEY"))
 	awsSessionToken := getEnv("AWS_SESSION_TOKEN", os.Getenv("AWS_SECURITY_TOKEN"))
 	port := getEnv("_LAMBDA_SERVER_PORT", "54321")
 
@@ -98,11 +98,15 @@ func main() {
 
 	cmd.Env = append(os.Environ(),
 		"_LAMBDA_SERVER_PORT="+port,
-		"AWS_ACCESS_KEY="+awsAccessKey,
-		"AWS_ACCESS_KEY_ID="+awsAccessKey,
-		"AWS_SECRET_KEY="+awsSecretKey,
-		"AWS_SECRET_ACCESS_KEY="+awsSecretKey,
 	)
+    if len(awsAccessKey) > 0 {
+        cmd.Env = append(cmd.Env, "AWS_ACCESS_KEY="+awsAccessKey)
+        cmd.Env = append(cmd.Env, "AWS_ACCESS_KEY_ID="+awsAccessKey)
+    }
+    if len(awsSecretKey) > 0 {
+        cmd.Env = append(cmd.Env, "AWS_SECRET_KEY="+awsSecretKey)
+        cmd.Env = append(cmd.Env, "AWS_SECRET_ACCESS_KEY="+awsSecretKey)
+    }
 	if len(awsSessionToken) > 0 {
 		cmd.Env = append(cmd.Env,
 			"AWS_SESSION_TOKEN="+awsSessionToken,

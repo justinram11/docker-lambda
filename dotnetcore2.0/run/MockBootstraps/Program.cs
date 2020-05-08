@@ -1,10 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.Loader;
 using AWSLambda.Internal.Bootstrap;
-using AWSLambda.Internal.Bootstrap.Context;
+using AWSLambda.Internal.Bootstrap.ErrorHandling;
 
 namespace MockLambdaRuntime
 {
@@ -14,15 +16,28 @@ namespace MockLambdaRuntime
         private const bool WaitForDebuggerFlagDefaultValue = false;
 
         /// Task root of lambda task
-        static string lambdaTaskRoot = EnvHelper.GetOrDefault("LAMBDA_TASK_ROOT", "/var/task");
+        static readonly string lambdaTaskRoot = EnvHelper.GetOrDefault("LAMBDA_TASK_ROOT", "/var/task");
 
         private static readonly TimeSpan _debuggerStatusQueryInterval = TimeSpan.FromMilliseconds(50);
         private static readonly TimeSpan _debuggerStatusQueryTimeout = TimeSpan.FromMinutes(10);
 
+        private static readonly IList<string> assemblyDirs = new List<string> { lambdaTaskRoot };
+
         /// Program entry point
         static void Main(string[] args)
         {
+            // Add all /var/lang/bin/shared/*/* directories to the search path
+            foreach (var di in new DirectoryInfo("/var/lang/bin/shared").EnumerateDirectories().SelectMany(di => di.EnumerateDirectories().Select(di2 => di2)))
+            {
+                assemblyDirs.Add(di.FullName);
+            }
             AssemblyLoadContext.Default.Resolving += OnAssemblyResolving;
+
+            //Console.CancelKeyPress += delegate {
+            //    // call methods to clean up
+            //};
+
+            Process mockServer = null;
 
             try
             {
@@ -30,6 +45,18 @@ namespace MockLambdaRuntime
 
                 var handler = GetFunctionHandler(positionalArgs);
                 var body = GetEventBody(positionalArgs);
+
+                var lambdaRuntime = new MockRuntime(handler, body);
+
+                mockServer = new Process();
+                mockServer.StartInfo.FileName = "/var/runtime/mockserver";
+                mockServer.StartInfo.CreateNoWindow = true;
+                mockServer.StartInfo.RedirectStandardInput = true;
+                mockServer.StartInfo.Environment["DOCKER_LAMBDA_NO_BOOTSTRAP"] = "1";
+                mockServer.StartInfo.Environment["DOCKER_LAMBDA_USE_STDIN"] = "1";
+                mockServer.Start();
+                mockServer.StandardInput.Write(body);
+                mockServer.StandardInput.Close();
 
                 if (shouldWaitForDebugger)
                 {
@@ -43,40 +70,10 @@ namespace MockLambdaRuntime
                     }
                 }
 
-                var lambdaContext = new MockLambdaContext(handler, body);
-
-                var userCodeLoader = new UserCodeLoader(handler, InternalLogger.NO_OP_LOGGER);
-                userCodeLoader.Init(Console.Error.WriteLine);
-
-                var lambdaContextInternal = new LambdaContextInternal(lambdaContext.RemainingTime,
-                                                                      LogAction, new Lazy<CognitoClientContextInternal>(),
-                                                                      lambdaContext.RequestId,
-                                                                      new Lazy<string>(lambdaContext.Arn),
-                                                                      new Lazy<string>(string.Empty),
-                                                                      new Lazy<string>(string.Empty),
-                                                                      Environment.GetEnvironmentVariables());
-
-                Exception lambdaException = null;
-
-                LogRequestStart(lambdaContext);
-                try
-                {
-                    userCodeLoader.Invoke(lambdaContext.InputStream, lambdaContext.OutputStream, lambdaContextInternal);
-                }
-                catch (Exception ex)
-                {
-                    lambdaException = ex;
-                }
-                LogRequestEnd(lambdaContext);
-
-                if (lambdaException == null)
-                {
-                    Console.WriteLine(lambdaContext.OutputText);
-                }
-                else
-                {
-                    Console.Error.WriteLine(lambdaException);
-                }
+                var lambdaBootstrap = new LambdaBootstrap(lambdaRuntime, InternalLogger.NO_OP_LOGGER);
+                UnhandledExceptionLogger.Register();
+                lambdaBootstrap.Initialize();
+                lambdaBootstrap.Invoke();
             }
 
             // Catch all unhandled exceptions from runtime, to prevent user from hanging on them while debugging
@@ -84,18 +81,27 @@ namespace MockLambdaRuntime
             {
                 Console.Error.WriteLine($"\nUnhandled exception occured in runner:\n{ex}");
             }
+            finally
+            {
+                if (mockServer != null) mockServer.Dispose();
+            }
         }
 
         /// Called when an assembly could not be resolved
-        private static Assembly OnAssemblyResolving(AssemblyLoadContext context, AssemblyName assembly)
+        private static Assembly OnAssemblyResolving(AssemblyLoadContext context, AssemblyName assemblyName)
         {
-            return context.LoadFromAssemblyPath(Path.Combine(lambdaTaskRoot, $"{assembly.Name}.dll"));
-        }
-
-        /// Try to log everything to stderr except the function result
-        private static void LogAction(string text)
-        {
-            Console.Error.WriteLine(text);
+            foreach (var dir in assemblyDirs)
+            {
+                try
+                {
+                    return context.LoadFromAssemblyPath(Path.Combine(dir, $"{assemblyName.Name}.dll"));
+                }
+                catch (FileNotFoundException)
+                {
+                    continue;
+                }
+            }
+            throw new FileNotFoundException($"{assemblyName.Name}.dll");
         }
 
         /// <summary>
@@ -123,22 +129,6 @@ namespace MockLambdaRuntime
 
             unprocessed = unprocessedList.ToArray();
             return flagValue;
-        }
-
-        static void LogRequestStart(MockLambdaContext context)
-        {
-            Console.Error.WriteLine($"START RequestId: {context.RequestId} Version: {context.FunctionVersion}");
-        }
-
-        static void LogRequestEnd(MockLambdaContext context)
-        {
-            Console.Error.WriteLine($"END  RequestId: {context.RequestId}");
-
-            Console.Error.WriteLine($"REPORT RequestId {context.RequestId}\t" +
-                                    $"Duration: {context.Duration} ms\t" +
-                                    $"Billed Duration: {context.BilledDuration} ms\t" +
-                                    $"Memory Size {context.MemorySize} MB\t" +
-                                    $"Max Memory Used: {context.MemoryUsed / (1024 * 1024)} MB");
         }
 
         /// Gets the function handler from arguments or environment

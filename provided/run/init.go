@@ -4,30 +4,42 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"log"
 	"math"
 	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"reflect"
 	"regexp"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/go-chi/chi"
 	"github.com/go-chi/render"
+	"github.com/rjeczalik/notify"
 )
 
-var okStatusResponse = &StatusResponse{Status: "OK", HTTPStatusCode: 202}
+var logDebug = os.Getenv("DOCKER_LAMBDA_DEBUG") != ""
+var stayOpen = os.Getenv("DOCKER_LAMBDA_STAY_OPEN") != ""
+var noBootstrap = os.Getenv("DOCKER_LAMBDA_NO_BOOTSTRAP") != ""
+var apiPort = getEnv("DOCKER_LAMBDA_API_PORT", "9001")
+var runtimePort = getEnv("DOCKER_LAMBDA_RUNTIME_PORT", "9001")
+var useStdin = os.Getenv("DOCKER_LAMBDA_USE_STDIN") != ""
+var noModifyLogs = os.Getenv("DOCKER_LAMBDA_NO_MODIFY_LOGS") != ""
+var watchMode = os.Getenv("DOCKER_LAMBDA_WATCH") != ""
 
-var curRequestID = fakeGuid()
 var curState = "STATE_INIT"
 
 var transitions = map[string]map[string]bool{
@@ -37,20 +49,66 @@ var transitions = map[string]map[string]bool{
 	"STATE_INVOKE_ERROR":    map[string]bool{"STATE_INVOKE_NEXT": true},
 }
 
-var mockContext = &MockLambdaContext{}
+var acceptedResponse = &statusResponse{Status: "OK", HTTPStatusCode: 202}
+
+var curContext *mockLambdaContext
+var bootstrapCmd *exec.Cmd
+var initPrinted bool
+var eventChan chan *mockLambdaContext
+var bootstrapExitedGracefully bool
+var bootstrapIsRunning bool
+var bootstrapPath *string
+var bootstrapArgs []string
+var bootstrapMutex sync.Mutex
+var logsBuf bytes.Buffer
+var serverInitEnd time.Time
+
+func newContext() *mockLambdaContext {
+	context := &mockLambdaContext{
+		RequestID:       fakeGUID(),
+		FnName:          getEnv("AWS_LAMBDA_FUNCTION_NAME", "test"),
+		Version:         getEnv("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST"),
+		MemSize:         getEnv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "1536"),
+		Timeout:         getEnv("AWS_LAMBDA_FUNCTION_TIMEOUT", "300"),
+		Region:          getEnv("AWS_REGION", getEnv("AWS_DEFAULT_REGION", "us-east-1")),
+		AccountID:       getEnv("AWS_ACCOUNT_ID", strconv.FormatInt(int64(rand.Int31()), 10)),
+		XAmznTraceID:    getEnv("_X_AMZN_TRACE_ID", ""),
+		ClientContext:   getEnv("AWS_LAMBDA_CLIENT_CONTEXT", ""),
+		CognitoIdentity: getEnv("AWS_LAMBDA_COGNITO_IDENTITY", ""),
+		Start:           time.Now(),
+		Done:            make(chan bool),
+	}
+	context.ParseTimeout()
+	context.ParseFunctionArn()
+	return context
+}
+
+type key int
+
+const (
+	keyRequestID key = iota
+)
 
 func main() {
 	rand.Seed(time.Now().UTC().UnixNano())
+	log.SetOutput(os.Stderr)
 
-	bootstrapPath := flag.String("bootstrap", "/var/runtime/bootstrap", "path to bootstrap")
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+
+	render.Respond = renderJSON
+
+	eventChan = make(chan *mockLambdaContext)
+
+	bootstrapPath = flag.String("bootstrap", "/var/runtime/bootstrap", "path to bootstrap")
 	bootstrapArgsString := flag.String("bootstrap-args", "[]", "additional arguments passed to bootstrap, as a stringified JSON Array")
+	flag.Bool("enable-msg-logs", false, "enable message logs")
 
 	flag.Parse()
 	positionalArgs := flag.Args()
 
-	var bootstrapArgs []string
 	if err := json.Unmarshal([]byte(*bootstrapArgsString), &bootstrapArgs); err != nil {
-		abortRequest(fmt.Errorf("Value of --bootstrap-args should be a JSON Array. Error: %s", err))
+		log.Fatal(fmt.Errorf("Value of --bootstrap-args should be a JSON Array. Error: %s", err))
 		return
 	}
 
@@ -60,67 +118,156 @@ func main() {
 	} else {
 		handler = getEnv("AWS_LAMBDA_FUNCTION_HANDLER", getEnv("_HANDLER", "handler"))
 	}
+	os.Setenv("_HANDLER", handler)
 
-	var eventBody string
+	var eventBody []byte
 	if len(positionalArgs) > 1 {
-		eventBody = positionalArgs[1]
+		eventBody = []byte(positionalArgs[1])
 	} else {
-		eventBody = os.Getenv("AWS_LAMBDA_EVENT_BODY")
-		if eventBody == "" {
-			if os.Getenv("DOCKER_LAMBDA_USE_STDIN") != "" {
-				stdin, _ := ioutil.ReadAll(os.Stdin)
-				eventBody = string(stdin)
+		eventBody = []byte(os.Getenv("AWS_LAMBDA_EVENT_BODY"))
+		if len(eventBody) == 0 {
+			if useStdin {
+				eventBody, _ = ioutil.ReadAll(os.Stdin)
 			} else {
-				eventBody = "{}"
+				eventBody = []byte("{}")
 			}
 		}
 	}
 
-	mockContext = &MockLambdaContext{
-		EventBody:       eventBody,
-		FnName:          getEnv("AWS_LAMBDA_FUNCTION_NAME", "test"),
-		Version:         getEnv("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST"),
-		MemSize:         getEnv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "1536"),
-		Timeout:         getEnv("AWS_LAMBDA_FUNCTION_TIMEOUT", "300"),
-		Region:          getEnv("AWS_REGION", getEnv("AWS_DEFAULT_REGION", "us-east-1")),
-		AccountId:       getEnv("AWS_ACCOUNT_ID", strconv.FormatInt(int64(rand.Int31()), 10)),
-		XAmznTraceId:    getEnv("_X_AMZN_TRACE_ID", ""),
-		ClientContext:   getEnv("AWS_LAMBDA_CLIENT_CONTEXT", ""),
-		CognitoIdentity: getEnv("AWS_LAMBDA_COGNITO_IDENTITY", ""),
-		Start:           time.Now(),
-		Pid:             1,
-		Done:            make(chan bool),
+	curContext = newContext()
+
+	os.Setenv("AWS_LAMBDA_FUNCTION_NAME", curContext.FnName)
+	os.Setenv("AWS_LAMBDA_FUNCTION_VERSION", curContext.Version)
+	os.Setenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", curContext.MemSize)
+	os.Setenv("AWS_LAMBDA_LOG_GROUP_NAME", "/aws/lambda/"+curContext.FnName)
+	os.Setenv("AWS_LAMBDA_LOG_STREAM_NAME", logStreamName(curContext.Version))
+	os.Setenv("AWS_REGION", curContext.Region)
+	os.Setenv("AWS_DEFAULT_REGION", curContext.Region)
+	os.Setenv("_X_AMZN_TRACE_ID", curContext.XAmznTraceID)
+
+	runtimeAddress := ":" + runtimePort
+	if apiPort != runtimePort {
+		// We can restrict runtime to 127.0.0.1 if we don't need the port for the Lambda API
+		runtimeAddress = "127.0.0.1" + runtimeAddress
 	}
-	mockContext.ParseTimeout()
-	mockContext.ParseFunctionArn()
+	runtimeListener, err := net.Listen("tcp", runtimeAddress)
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
+
+	var runtimeServer *http.Server
+
+	runtimeRouter := createRuntimeRouter()
+	runtimeServer = &http.Server{Handler: addAPIRoutes(runtimeRouter)}
+
+	go runtimeServer.Serve(runtimeListener)
+
+	exitCode := 0
+
+	serverInitEnd = time.Now()
+
+	if stayOpen {
+		if watchMode {
+			setupFileWatchers()
+		}
+		setupSighupHandler()
+		systemLog(fmt.Sprintf("Lambda API listening on port %s...", apiPort))
+		<-interrupt
+	} else {
+		res, err := http.Post(
+			"http://127.0.0.1:"+runtimePort+"/2015-03-31/functions/"+curContext.FnName+"/invocations",
+			"application/json",
+			bytes.NewBuffer(eventBody),
+		)
+		if err != nil {
+			log.Fatal(err)
+			return
+		}
+		functionError := res.Header.Get("X-Amz-Function-Error")
+
+		body, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			log.Fatal(err)
+			return
+		}
+		res.Body.Close()
+
+		fmt.Println("\n" + formatOneLineJSON(body))
+
+		if functionError != "" {
+			exitCode = 1
+		}
+	}
+
+	exit(exitCode)
+}
+
+func setupSighupHandler() {
+	sighupReceiver := make(chan os.Signal, 1)
+	signal.Notify(sighupReceiver, syscall.SIGHUP)
+	go func() {
+		for {
+			<-sighupReceiver
+			systemLog(fmt.Sprintf("SIGHUP received, restarting bootstrap..."))
+			reboot()
+		}
+	}()
+}
+
+func setupFileWatchers() {
+	fileWatcher := make(chan notify.EventInfo, 1)
+	if err := notify.Watch("/var/task/...", fileWatcher, notify.All); err != nil {
+		log.Fatal(err)
+	}
+	if err := notify.Watch("/opt/...", fileWatcher, notify.All); err != nil {
+		log.Fatal(err)
+	}
+	go func() {
+		for {
+			ei := <-fileWatcher
+			debug("Received notify event: ", ei)
+			systemLog(fmt.Sprintf("Handler/layer file changed, restarting bootstrap..."))
+			reboot()
+		}
+	}()
+}
+
+func formatOneLineJSON(body []byte) string {
+	payloadObj := &json.RawMessage{}
+	if json.Unmarshal(body, payloadObj) == nil {
+		if formattedPayload, err := json.Marshal(payloadObj); err == nil {
+			body = formattedPayload
+		}
+	}
+	return string(body)
+}
+
+func ensureBootstrapIsRunning(context *mockLambdaContext) error {
+	if noBootstrap || bootstrapIsRunning {
+		return nil
+	}
+	bootstrapMutex.Lock()
+	defer bootstrapMutex.Unlock()
+	if bootstrapIsRunning {
+		return nil
+	}
+	for _, cmdPath := range []string{*bootstrapPath, "/var/task/bootstrap", "/opt/bootstrap"} {
+		if fi, err := os.Stat(cmdPath); err == nil && !fi.IsDir() {
+			bootstrapCmd = exec.Command(cmdPath, bootstrapArgs...)
+			break
+		}
+	}
+	if bootstrapCmd == nil {
+		return fmt.Errorf("Couldn't find valid bootstrap(s): [/var/task/bootstrap /opt/bootstrap]")
+	}
 
 	awsAccessKey := getEnv("AWS_ACCESS_KEY", os.Getenv("AWS_ACCESS_KEY_ID"))
 	awsSecretKey := getEnv("AWS_SECRET_KEY", os.Getenv("AWS_SECRET_ACCESS_KEY"))
 	awsSessionToken := getEnv("AWS_SESSION_TOKEN", os.Getenv("AWS_SECURITY_TOKEN"))
 
-	os.Setenv("AWS_LAMBDA_FUNCTION_NAME", mockContext.FnName)
-	os.Setenv("AWS_LAMBDA_FUNCTION_VERSION", mockContext.Version)
-	os.Setenv("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", mockContext.MemSize)
-	os.Setenv("AWS_LAMBDA_LOG_GROUP_NAME", "/aws/lambda/"+mockContext.FnName)
-	os.Setenv("AWS_LAMBDA_LOG_STREAM_NAME", logStreamName(mockContext.Version))
-	os.Setenv("AWS_REGION", mockContext.Region)
-	os.Setenv("AWS_DEFAULT_REGION", mockContext.Region)
-	os.Setenv("_X_AMZN_TRACE_ID", mockContext.XAmznTraceId)
-	os.Setenv("_HANDLER", handler)
-
-	var cmd *exec.Cmd
-	for _, cmdPath := range []string{*bootstrapPath, "/var/task/bootstrap", "/opt/bootstrap"} {
-		if fi, err := os.Stat(cmdPath); err == nil && !fi.IsDir() {
-			cmd = exec.Command(cmdPath, bootstrapArgs...)
-			break
-		}
-	}
-	if cmd == nil {
-		abortRequest(fmt.Errorf("Couldn't find valid bootstrap(s): [/var/task/bootstrap /opt/bootstrap]"))
-	}
-
-	cmd.Env = append(os.Environ(),
-		"AWS_LAMBDA_RUNTIME_API=127.0.0.1:9001",
+	bootstrapCmd.Env = append(os.Environ(),
+		"AWS_LAMBDA_RUNTIME_API=127.0.0.1:"+runtimePort,
 	)
 	if len(awsAccessKey) > 0 {
 	    cmd.Env = append(cmd.Env, "AWS_ACCESS_KEY_ID="+awsAccessKey)
@@ -129,16 +276,169 @@ func main() {
 	    cmd.Env = append(cmd.Env, "AWS_SECRET_ACCESS_KEY="+awsSecretKey)
 	}
 	if len(awsSessionToken) > 0 {
-		cmd.Env = append(cmd.Env, "AWS_SESSION_TOKEN="+awsSessionToken)
+		bootstrapCmd.Env = append(bootstrapCmd.Env, "AWS_SESSION_TOKEN="+awsSessionToken)
 	}
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	mockContext.Cmd = cmd
+	if stayOpen {
+		bootstrapCmd.Stdout = io.MultiWriter(os.Stdout, &logsBuf)
+		bootstrapCmd.Stderr = io.MultiWriter(os.Stderr, &logsBuf)
+	} else {
+		bootstrapCmd.Stdout = os.Stderr
+		bootstrapCmd.Stderr = os.Stderr
+	}
+	if !noModifyLogs {
+		bootstrapCmd.Stdout = &replaceWriter{writer: bootstrapCmd.Stdout, old: []byte("\r"), new: []byte("\n")}
+		bootstrapCmd.Stderr = &replaceWriter{writer: bootstrapCmd.Stderr, old: []byte("\r"), new: []byte("\n")}
+	}
 
-	render.Respond = renderJson
+	bootstrapCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	if err := bootstrapCmd.Start(); err != nil {
+		return err
+	}
+
+	bootstrapIsRunning = true
+	bootstrapExitedGracefully = false
+
+	// Get an initial read of memory, and update when we finish
+	context.MaxMem, _ = allProcsMemoryInMb()
+
+	go func() {
+		bootstrapCmd.Wait()
+		bootstrapIsRunning = false
+		curState = "STATE_INIT"
+		if !bootstrapExitedGracefully {
+			// context may have changed, use curContext instead
+			curContext.SetError(fmt.Errorf("Runtime exited without providing a reason"))
+		}
+	}()
+
+	return nil
+}
+
+func exit(exitCode int) {
+	killBootstrap()
+	os.Exit(exitCode)
+}
+
+func reboot() {
+	if noBootstrap {
+		os.Exit(2)
+	} else {
+		killBootstrap()
+	}
+}
+
+func killBootstrap() {
+	bootstrapExitedGracefully = true
+	if bootstrapCmd != nil && bootstrapCmd.Process != nil {
+		syscall.Kill(-bootstrapCmd.Process.Pid, syscall.SIGKILL)
+	}
+}
+
+func waitForContext(context *mockLambdaContext) {
+	if err := ensureBootstrapIsRunning(context); err != nil {
+		context.EndInvoke(err)
+	} else {
+		eventChan <- context
+		<-context.Done
+	}
+}
+
+func addAPIRoutes(r *chi.Mux) *chi.Mux {
+	r.Post("/2015-03-31/functions/{function}/invocations", func(w http.ResponseWriter, r *http.Request) {
+		context := newContext()
+
+		if r.Header.Get("X-Amz-Invocation-Type") != "" {
+			context.InvocationType = r.Header.Get("X-Amz-Invocation-Type")
+		}
+		if r.Header.Get("X-Amz-Client-Context") != "" {
+			buf, err := base64.StdEncoding.DecodeString(r.Header.Get("X-Amz-Client-Context"))
+			if err != nil {
+				render.Render(w, r, &errResponse{
+					HTTPStatusCode: 400,
+					ErrorType:      "ClientContextDecodingError",
+					ErrorMessage:   err.Error(),
+				})
+				return
+			}
+			context.ClientContext = string(buf)
+		}
+		if r.Header.Get("X-Amz-Log-Type") != "" {
+			context.LogType = r.Header.Get("X-Amz-Log-Type")
+		}
+
+		if context.InvocationType == "DryRun" {
+			w.Header().Set("x-amzn-RequestId", context.RequestID)
+			w.Header().Set("x-amzn-Remapped-Content-Length", "0")
+			w.WriteHeader(204)
+			return
+		}
+
+		if body, err := ioutil.ReadAll(r.Body); err == nil {
+			context.EventBody = string(body)
+		} else {
+			render.Render(w, r, &errResponse{
+				HTTPStatusCode: 500,
+				ErrorType:      "BodyReadError",
+				ErrorMessage:   err.Error(),
+			})
+			return
+		}
+		r.Body.Close()
+
+		if context.InvocationType == "Event" {
+			w.Header().Set("x-amzn-RequestId", context.RequestID)
+			w.Header().Set("x-amzn-Remapped-Content-Length", "0")
+			w.Header().Set("X-Amzn-Trace-Id", context.XAmznTraceID)
+			w.WriteHeader(202)
+			go waitForContext(context)
+			return
+		}
+
+		waitForContext(context)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("x-amzn-RequestId", context.RequestID)
+		w.Header().Set("x-amzn-Remapped-Content-Length", "0")
+		w.Header().Set("X-Amz-Executed-Version", context.Version)
+		w.Header().Set("X-Amzn-Trace-Id", context.XAmznTraceID)
+
+		if context.LogType == "Tail" {
+			// We assume context.LogTail is already base64 encoded
+			w.Header().Set("X-Amz-Log-Result", context.LogTail)
+		}
+
+		if context.Reply.Error != nil {
+			errorType := "Unhandled"
+			if context.ErrorType != "" {
+				errorType = context.ErrorType
+			}
+			w.Header().Set("X-Amz-Function-Error", errorType)
+		}
+
+		// Lambda will usually return the payload instead of an error if the payload exists
+		if len(context.Reply.Payload) > 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(context.Reply.Payload)), 10))
+			w.Write(context.Reply.Payload)
+			return
+		}
+
+		if payload, err := json.Marshal(context.Reply.Error); err == nil {
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(payload)), 10))
+			w.Write(payload)
+		} else {
+			render.Render(w, r, &errResponse{
+				HTTPStatusCode: 500,
+				ErrorType:      "ErrorMarshalError",
+				ErrorMessage:   err.Error(),
+			})
+		}
+	})
+	return r
+}
+
+func createRuntimeRouter() *chi.Mux {
 	r := chi.NewRouter()
 
 	r.Route("/2018-06-01", func(r chi.Router) {
@@ -149,34 +449,58 @@ func main() {
 		r.Route("/runtime", func(r chi.Router) {
 			r.
 				With(updateState("STATE_INIT_ERROR")).
-				Post("/init/error", handleErrorRequest)
+				Post("/init/error", func(w http.ResponseWriter, r *http.Request) {
+					debug("In /init/error")
+					curContext = <-eventChan
+					handleErrorRequest(w, r)
+					curContext.EndInvoke(nil)
+				})
 
 			r.
 				With(updateState("STATE_INVOKE_NEXT")).
 				Get("/invocation/next", func(w http.ResponseWriter, r *http.Request) {
-					if mockContext.RequestId == "" {
-						mockContext.RequestId = curRequestID
-						mockContext.InitEnd = time.Now()
-						logStartRequest()
-					} else if mockContext.Reply != nil {
-						endInvoke(nil)
+					debug("In /invocation/next")
+
+					if curContext.Reply != nil {
+						debug("Reply is not nil")
+						curContext.EndInvoke(nil)
+					}
+
+					closeNotify := w.(http.CloseNotifier).CloseNotify()
+					go func() {
+						<-closeNotify
+						debug("Connection closed, sending ignore event")
+						eventChan <- &mockLambdaContext{Ignore: true}
+					}()
+
+					debug("Waiting for next event...")
+					context := <-eventChan
+					if context.Ignore {
+						debug("Ignore event received, returning")
+						w.Write([]byte{})
 						return
 					}
+					curContext = context
+					context.LogStartRequest()
 
 					w.Header().Set("Content-Type", "application/json")
-					w.Header().Set("Lambda-Runtime-Aws-Request-Id", curRequestID)
-					w.Header().Set("Lambda-Runtime-Deadline-Ms", strconv.FormatInt(mockContext.Deadline().UnixNano()/1e6, 10))
-					w.Header().Set("Lambda-Runtime-Invoked-Function-Arn", mockContext.InvokedFunctionArn)
-					w.Header().Set("Lambda-Runtime-Trace-Id", mockContext.XAmznTraceId)
+					w.Header().Set("Lambda-Runtime-Aws-Request-Id", context.RequestID)
+					w.Header().Set("Lambda-Runtime-Deadline-Ms", strconv.FormatInt(context.Deadline().UnixNano()/int64(time.Millisecond), 10))
+					w.Header().Set("Lambda-Runtime-Invoked-Function-Arn", context.InvokedFunctionArn)
+					w.Header().Set("Lambda-Runtime-Trace-Id", context.XAmznTraceID)
 
-					if mockContext.ClientContext != "" {
-						w.Header().Set("Lambda-Runtime-Client-Context", mockContext.ClientContext)
+					if context.ClientContext != "" {
+						w.Header().Set("Lambda-Runtime-Client-Context", context.ClientContext)
 					}
-					if mockContext.CognitoIdentity != "" {
-						w.Header().Set("Lambda-Runtime-Cognito-Identity", mockContext.CognitoIdentity)
+					if context.CognitoIdentity != "" {
+						w.Header().Set("Lambda-Runtime-Cognito-Identity", context.CognitoIdentity)
 					}
 
-					w.Write([]byte(eventBody))
+					if context.LogType != "" {
+						w.Header().Set("Docker-Lambda-Log-Type", context.LogType)
+					}
+
+					w.Write([]byte(context.EventBody))
 				})
 
 			r.Route("/invocation/{requestID}", func(r chi.Router) {
@@ -187,17 +511,22 @@ func main() {
 					Post("/response", func(w http.ResponseWriter, r *http.Request) {
 						body, err := ioutil.ReadAll(r.Body)
 						if err != nil {
-							render.Render(w, r, &ErrResponse{
+							render.Render(w, r, &errResponse{
 								HTTPStatusCode: 500,
-								ErrorType:      "BodyReadError", // TODO: not sure what this would be in production?
+								ErrorType:      "BodyReadError", // Not sure what this would be in production?
 								ErrorMessage:   err.Error(),
 							})
 							return
 						}
+						r.Body.Close()
 
-						mockContext.Reply = &InvokeResponse{Payload: body}
+						debug("Setting Reply in /response")
+						curContext.Reply = &invokeResponse{Payload: body}
 
-						render.Render(w, r, okStatusResponse)
+						curContext.SetLogTail(r)
+						curContext.SetInitEnd(r)
+
+						render.Render(w, r, acceptedResponse)
 						w.(http.Flusher).Flush()
 					})
 
@@ -207,69 +536,46 @@ func main() {
 			})
 		})
 	})
-
-	listener, err := net.Listen("tcp", "127.0.0.1:9001")
-	if err != nil {
-		abortRequest(err)
-		return
-	}
-
-	server := &http.Server{Handler: r}
-
-	go server.Serve(listener)
-
-	res, err := http.Get("http://127.0.0.1:9001/2018-06-01/ping")
-	if err != nil {
-		abortRequest(err)
-		return
-	}
-	body, err := ioutil.ReadAll(res.Body)
-	if err != nil || string(body) != "pong" {
-		abortRequest(err)
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		abortRequest(err)
-		return
-	}
-	go func() {
-		cmd.Wait()
-		if mockContext.Reply == nil {
-			abortRequest(fmt.Errorf("Runtime exited without providing a reason"))
-		}
-	}()
-
-	<-mockContext.Done
+	return r
 }
 
 func handleErrorRequest(w http.ResponseWriter, r *http.Request) {
-	lambdaErr := &LambdaError{}
-	statusResponse := okStatusResponse
+	lambdaErr := &lambdaError{}
+	response := acceptedResponse
 
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil || json.Unmarshal(body, lambdaErr) != nil {
-		statusResponse = &StatusResponse{Status: "InvalidErrorShape", HTTPStatusCode: 299}
+		debug("Could not parse error body as JSON")
+		debug(body)
+		response = &statusResponse{Status: "InvalidErrorShape", HTTPStatusCode: 299}
+		lambdaErr = &lambdaError{Message: "InvalidErrorShape"}
 	}
+	r.Body.Close()
 
 	errorType := r.Header.Get("Lambda-Runtime-Function-Error-Type")
 	if errorType != "" {
-		lambdaErr.Type = errorType
+		curContext.ErrorType = errorType
 	}
 
-	mockContext.Reply = &InvokeResponse{Error: lambdaErr}
+	// TODO: Figure out whether we want to handle Lambda-Runtime-Function-XRay-Error-Cause
 
-	render.Render(w, r, statusResponse)
+	debug("Setting Reply in handleErrorRequest")
+	debug(lambdaErr)
+
+	curContext.Reply = &invokeResponse{Error: lambdaErr}
+
+	curContext.SetLogTail(r)
+	curContext.SetInitEnd(r)
+
+	render.Render(w, r, response)
 	w.(http.Flusher).Flush()
-
-	endInvoke(nil)
 }
 
 func updateState(nextState string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if _, ok := transitions[nextState][curState]; !ok {
-				render.Render(w, r, &ErrResponse{
+				render.Render(w, r, &errResponse{
 					HTTPStatusCode: 403,
 					ErrorType:      "InvalidStateTransition",
 					ErrorMessage:   fmt.Sprintf("Transition from %s to %s is not allowed.", curState, nextState),
@@ -286,8 +592,8 @@ func awsRequestIDValidator(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestID := chi.URLParam(r, "requestID")
 
-		if requestID != curRequestID {
-			render.Render(w, r, &ErrResponse{
+		if requestID != curContext.RequestID {
+			render.Render(w, r, &errResponse{
 				HTTPStatusCode: 400,
 				ErrorType:      "InvalidRequestID",
 				ErrorMessage:   "Invalid request ID",
@@ -295,34 +601,34 @@ func awsRequestIDValidator(next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), "requestID", requestID)
+		ctx := context.WithValue(r.Context(), keyRequestID, requestID)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-type StatusResponse struct {
+type statusResponse struct {
 	HTTPStatusCode int    `json:"-"`
 	Status         string `json:"status"`
 }
 
-func (sr *StatusResponse) Render(w http.ResponseWriter, r *http.Request) error {
+func (sr *statusResponse) Render(w http.ResponseWriter, r *http.Request) error {
 	render.Status(r, sr.HTTPStatusCode)
 	return nil
 }
 
-type ErrResponse struct {
+type errResponse struct {
 	HTTPStatusCode int    `json:"-"`
 	ErrorType      string `json:"errorType,omitempty"`
 	ErrorMessage   string `json:"errorMessage"`
 }
 
-func (e *ErrResponse) Render(w http.ResponseWriter, r *http.Request) error {
+func (e *errResponse) Render(w http.ResponseWriter, r *http.Request) error {
 	render.Status(r, e.HTTPStatusCode)
 	return nil
 }
 
-func renderJson(w http.ResponseWriter, r *http.Request, v interface{}) {
+func renderJSON(w http.ResponseWriter, r *http.Request, v interface{}) {
 	buf := &bytes.Buffer{}
 	enc := json.NewEncoder(buf)
 	enc.SetEscapeHTML(true)
@@ -338,95 +644,6 @@ func renderJson(w http.ResponseWriter, r *http.Request, v interface{}) {
 	w.Write(buf.Bytes())
 }
 
-func abortRequest(err error) {
-	endInvoke(&ExitError{err: err})
-}
-
-func endInvoke(err error) {
-	logStart := false
-	if mockContext.RequestId == "" {
-		mockContext.RequestId = curRequestID
-		logStart = true
-	}
-	mockContext.MaxMem, _ = allProcsMemoryInMb()
-	if mockContext.Cmd != nil && mockContext.Cmd.Process != nil {
-		syscall.Kill(-mockContext.Cmd.Process.Pid, syscall.SIGKILL)
-	}
-	if logStart {
-		logStartRequest()
-	}
-	logEndRequest(err)
-	mockContext.Done <- true
-}
-
-func logStartRequest() {
-	systemLog("START RequestId: " + mockContext.RequestId + " Version: " + mockContext.Version)
-}
-
-func logEndRequest(err error) {
-	if mockContext.InitEnd.IsZero() {
-		mockContext.InitEnd = time.Now()
-	}
-
-	initDiffMs := math.Min(float64(mockContext.InitEnd.Sub(mockContext.Start).Nanoseconds()),
-		float64(mockContext.TimeoutDuration.Nanoseconds())) / 1e6
-
-	diffMs := math.Min(float64(time.Now().Sub(mockContext.InitEnd).Nanoseconds()),
-		float64(mockContext.TimeoutDuration.Nanoseconds())) / 1e6
-
-	initStr := ""
-	if mockContext.Cmd != nil && mockContext.Cmd.Path != "/var/runtime/bootstrap" {
-		initStr = fmt.Sprintf("Init Duration: %.2f ms\t", initDiffMs)
-	}
-
-	systemLog("END RequestId: " + mockContext.RequestId)
-	systemLog(fmt.Sprintf(
-		"REPORT RequestId: %s\t"+
-			initStr+
-			"Duration: %.2f ms\t"+
-			"Billed Duration: %.f ms\t"+
-			"Memory Size: %s MB\t"+
-			"Max Memory Used: %d MB\t",
-		mockContext.RequestId, diffMs, math.Ceil(diffMs/100)*100, mockContext.MemSize, mockContext.MaxMem))
-
-	if err == nil && mockContext.HasExpired() {
-		err = mockContext.TimeoutErr()
-	}
-
-	if err != nil {
-		responseErr := LambdaError{
-			Message: err.Error(),
-			Type:    getErrorType(err),
-		}
-		if responseErr.Type == "errorString" {
-			responseErr.Type = ""
-			if responseErr.Message == "unexpected EOF" {
-				responseErr.Message = "RequestId: " + mockContext.RequestId + " Process exited before completing request"
-			}
-		} else if responseErr.Type == "ExitError" {
-			responseErr.Type = "Runtime.ExitError" // XXX: Hack to add 'Runtime.' to error type
-		}
-		systemErr(&responseErr)
-		os.Exit(1)
-	}
-
-	if mockContext.Reply.Error != nil {
-		systemErr(mockContext.Reply.Error)
-		os.Exit(1)
-	}
-
-	// Try to format json as one line – if it's json
-	payload := mockContext.Reply.Payload
-	payloadObj := &json.RawMessage{}
-	if json.Unmarshal(payload, payloadObj) == nil {
-		if formattedPayload, err := json.Marshal(payloadObj); err == nil {
-			payload = formattedPayload
-		}
-	}
-
-	fmt.Println(string(payload))
-}
-
 func getEnv(key, fallback string) string {
 	value := os.Getenv(key)
 	if value != "" {
@@ -435,7 +652,7 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func fakeGuid() string {
+func fakeGUID() string {
 	randBuf := make([]byte, 16)
 	rand.Read(randBuf)
 
@@ -466,9 +683,9 @@ func logStreamName(version string) string {
 	return time.Now().Format("2006/01/02") + "/[" + version + "]" + string(hexBuf)
 }
 
-func arn(region string, accountId string, fnName string) string {
+func arn(region string, accountID string, fnName string) string {
 	nonDigit := regexp.MustCompile(`[^\d]`)
-	return "arn:aws:lambda:" + region + ":" + nonDigit.ReplaceAllString(accountId, "") + ":function:" + fnName
+	return "arn:aws:lambda:" + region + ":" + nonDigit.ReplaceAllString(accountID, "") + ":function:" + fnName
 }
 
 func allProcsMemoryInMb() (uint64, error) {
@@ -519,10 +736,16 @@ func calculateMemoryInKb(pid int) (uint64, error) {
 }
 
 func getErrorType(err interface{}) string {
-	if errorType := reflect.TypeOf(err); errorType.Kind() == reflect.Ptr {
+	errorType := reflect.TypeOf(err)
+	if errorType.Kind() == reflect.Ptr {
 		return errorType.Elem().Name()
-	} else {
-		return errorType.Name()
+	}
+	return errorType.Name()
+}
+
+func debug(v ...interface{}) {
+	if logDebug {
+		log.Println(v...)
 	}
 }
 
@@ -530,50 +753,51 @@ func systemLog(msg string) {
 	fmt.Fprintln(os.Stderr, "\033[32m"+msg+"\033[0m")
 }
 
-// Try to match the output of the Lambda web console
-func systemErr(err *LambdaError) {
-	jsonBytes, _ := json.MarshalIndent(err, "", "  ")
-	fmt.Fprintln(os.Stderr, "\033[31m"+string(jsonBytes)+"\033[0m")
+type exitError struct {
+	err     error
+	context *mockLambdaContext
 }
 
-type ExitError struct {
-	err error
+func (e *exitError) Error() string {
+	return fmt.Sprintf("RequestId: %s Error: %s", e.context.RequestID, e.err.Error())
 }
 
-func (e *ExitError) Error() string {
-	return fmt.Sprintf("RequestId: %s Error: %s", curRequestID, e.err.Error())
+type lambdaError struct {
+	Type       string       `json:"errorType,omitempty"`
+	Message    string       `json:"errorMessage"`
+	StackTrace []*string    `json:"stackTrace,omitempty"`
+	Cause      *lambdaError `json:"cause,omitempty"`
 }
 
-type LambdaError struct {
-	Type       string    `json:"errorType,omitempty"`
-	Message    string    `json:"errorMessage"`
-	StackTrace []*string `json:"stackTrace,omitempty"`
-}
-
-type MockLambdaContext struct {
-	RequestId          string
+type mockLambdaContext struct {
+	RequestID          string
 	EventBody          string
 	FnName             string
 	Version            string
 	MemSize            string
 	Timeout            string
 	Region             string
-	AccountId          string
-	XAmznTraceId       string
+	AccountID          string
+	XAmznTraceID       string
 	InvokedFunctionArn string
 	ClientContext      string
 	CognitoIdentity    string
 	Start              time.Time
+	InvokeWait         time.Time
 	InitEnd            time.Time
 	TimeoutDuration    time.Duration
-	Pid                int
-	Reply              *InvokeResponse
+	Reply              *invokeResponse
 	Done               chan bool
-	Cmd                *exec.Cmd
 	MaxMem             uint64
+	InvocationType     string
+	LogType            string
+	LogTail            string // base64 encoded tail, no greater than 4096 bytes
+	ErrorType          string // Unhandled vs Handled
+	Ended              bool
+	Ignore             bool
 }
 
-func (mc *MockLambdaContext) ParseTimeout() {
+func (mc *mockLambdaContext) ParseTimeout() {
 	timeoutDuration, err := time.ParseDuration(mc.Timeout + "s")
 	if err != nil {
 		panic(err)
@@ -581,24 +805,174 @@ func (mc *MockLambdaContext) ParseTimeout() {
 	mc.TimeoutDuration = timeoutDuration
 }
 
-func (mc *MockLambdaContext) ParseFunctionArn() {
-	mc.InvokedFunctionArn = getEnv("AWS_LAMBDA_FUNCTION_INVOKED_ARN", arn(mc.Region, mc.AccountId, mc.FnName))
+func (mc *mockLambdaContext) ParseFunctionArn() {
+	mc.InvokedFunctionArn = getEnv("AWS_LAMBDA_FUNCTION_INVOKED_ARN", arn(mc.Region, mc.AccountID, mc.FnName))
 }
 
-func (mc *MockLambdaContext) Deadline() time.Time {
+func (mc *mockLambdaContext) Deadline() time.Time {
 	return mc.Start.Add(mc.TimeoutDuration)
 }
 
-func (mc *MockLambdaContext) HasExpired() bool {
+func (mc *mockLambdaContext) HasExpired() bool {
 	return time.Now().After(mc.Deadline())
 }
 
-func (mc *MockLambdaContext) TimeoutErr() error {
+func (mc *mockLambdaContext) TimeoutErr() error {
 	return fmt.Errorf("%s %s Task timed out after %s.00 seconds", time.Now().Format("2006-01-02T15:04:05.999Z"),
-		mc.RequestId, mc.Timeout)
+		mc.RequestID, mc.Timeout)
 }
 
-type InvokeResponse struct {
+func (mc *mockLambdaContext) SetLogTail(r *http.Request) {
+	defer logsBuf.Reset()
+
+	mc.LogTail = ""
+
+	if mc.LogType != "Tail" {
+		return
+	}
+	if noBootstrap {
+		mc.LogTail = r.Header.Get("Docker-Lambda-Log-Result")
+		return
+	}
+
+	// This is very annoying but seems to be necessary to ensure we get all the stdout/stderr from the subprocess
+	time.Sleep(1 * time.Millisecond)
+
+	logs := logsBuf.Bytes()
+
+	if len(logs) == 0 {
+		return
+	}
+
+	if len(logs) > 4096 {
+		logs = logs[len(logs)-4096:]
+	}
+	mc.LogTail = base64.StdEncoding.EncodeToString(logs)
+}
+
+func (mc *mockLambdaContext) SetInitEnd(r *http.Request) {
+	invokeWaitHeader := r.Header.Get("Docker-Lambda-Invoke-Wait")
+	if invokeWaitHeader != "" {
+		invokeWaitMs, err := strconv.ParseInt(invokeWaitHeader, 10, 64)
+		if err != nil {
+			log.Fatal(fmt.Errorf("Could not parse Docker-Lambda-Invoke-Wait header as int. Error: %s", err))
+			return
+		}
+		mc.InvokeWait = time.Unix(0, invokeWaitMs*int64(time.Millisecond))
+	}
+	initEndHeader := r.Header.Get("Docker-Lambda-Init-End")
+	if initEndHeader != "" {
+		initEndMs, err := strconv.ParseInt(initEndHeader, 10, 64)
+		if err != nil {
+			log.Fatal(fmt.Errorf("Could not parse Docker-Lambda-Init-End header as int. Error: %s", err))
+			return
+		}
+		mc.InitEnd = time.Unix(0, initEndMs*int64(time.Millisecond))
+	}
+}
+
+func (mc *mockLambdaContext) SetError(exitErr error) {
+	err := &exitError{err: exitErr, context: mc}
+	responseErr := lambdaError{
+		Message: err.Error(),
+		Type:    getErrorType(err),
+	}
+	if responseErr.Type == "errorString" {
+		responseErr.Type = ""
+		if responseErr.Message == "unexpected EOF" {
+			responseErr.Message = "RequestId: " + mc.RequestID + " Process exited before completing request"
+		}
+	} else if responseErr.Type == "ExitError" {
+		responseErr.Type = "Runtime.ExitError" // XXX: Hack to add 'Runtime.' to error type
+	}
+	debug("Setting Reply in SetError")
+	debug(responseErr)
+	if mc.Reply == nil {
+		mc.Reply = &invokeResponse{Error: &responseErr}
+	} else {
+		mc.Reply.Error = &responseErr
+	}
+}
+
+func (mc *mockLambdaContext) EndInvoke(exitErr error) {
+	debug("EndInvoke()")
+	if mc.Ended {
+		return
+	}
+	mc.Ended = true
+	if exitErr != nil {
+		debug(exitErr)
+		mc.SetError(exitErr)
+	} else if (mc.Reply == nil || mc.Reply.Error == nil) && mc.HasExpired() {
+		mc.Reply = &invokeResponse{
+			Error: &lambdaError{
+				Message: mc.TimeoutErr().Error(),
+			},
+		}
+	}
+	if mc.InitEnd.IsZero() {
+		mc.LogStartRequest()
+	}
+
+	mc.LogEndRequest()
+
+	if exitErr == nil {
+		mc.Done <- true
+	}
+}
+
+func (mc *mockLambdaContext) LogStartRequest() {
+	mc.InitEnd = time.Now()
+	systemLog("START RequestId: " + mc.RequestID + " Version: " + mc.Version)
+}
+
+func (mc *mockLambdaContext) LogEndRequest() {
+	maxMem, _ := allProcsMemoryInMb()
+	if maxMem > mc.MaxMem {
+		mc.MaxMem = maxMem
+	}
+
+	diffMs := math.Min(float64(time.Now().Sub(mc.InitEnd).Nanoseconds()),
+		float64(mc.TimeoutDuration.Nanoseconds())) / float64(time.Millisecond)
+
+	initStr := ""
+	if !initPrinted {
+		proc1stat, _ := os.Stat("/proc/1")
+		processStartTime := proc1stat.ModTime()
+		if mc.InvokeWait.IsZero() {
+			mc.InvokeWait = serverInitEnd
+		}
+		if mc.InvokeWait.Before(processStartTime) {
+			mc.InvokeWait = processStartTime
+		}
+		initDiffNs := mc.InvokeWait.Sub(proc1stat.ModTime()).Nanoseconds() + mc.InitEnd.Sub(mc.Start).Nanoseconds()
+		initDiffMs := math.Min(float64(initDiffNs), float64(mc.TimeoutDuration.Nanoseconds())) / float64(time.Millisecond)
+		initStr = fmt.Sprintf("Init Duration: %.2f ms\t", initDiffMs)
+		initPrinted = true
+	}
+
+	systemLog("END RequestId: " + mc.RequestID)
+	systemLog(fmt.Sprintf(
+		"REPORT RequestId: %s\t"+
+			initStr+
+			"Duration: %.2f ms\t"+
+			"Billed Duration: %.f ms\t"+
+			"Memory Size: %s MB\t"+
+			"Max Memory Used: %d MB\t",
+		mc.RequestID, diffMs, math.Ceil(diffMs/100)*100, mc.MemSize, mc.MaxMem))
+}
+
+type invokeResponse struct {
 	Payload []byte
-	Error   *LambdaError
+	Error   *lambdaError
+}
+
+type replaceWriter struct {
+	writer io.Writer
+	old    []byte
+	new    []byte
+}
+
+func (r *replaceWriter) Write(p []byte) (n int, err error) {
+	return r.writer.Write(bytes.ReplaceAll(p, r.old, r.new))
 }

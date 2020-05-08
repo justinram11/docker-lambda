@@ -7,16 +7,20 @@ ENV PATH=/var/lang/bin:$PATH \
     PKG_CONFIG_PATH=/var/lang/lib/pkgconfig:/usr/lib64/pkgconfig:/usr/share/pkgconfig
 
 RUN rm -rf /var/runtime /var/lang && \
+  export PYTHON_VERSION=3.6.10 && \
   curl https://lambci.s3.amazonaws.com/fs/python3.6.tgz | tar -xz -C / && \
   sed -i '/^prefix=/c\prefix=/var/lang' /var/lang/lib/pkgconfig/python-3.6.pc && \
-  curl https://www.python.org/ftp/python/3.6.8/Python-3.6.8.tar.xz | tar -xJ && \
-  cd Python-3.6.8 && \
+  curl https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tar.xz | tar -xJ && \
+  cd Python-${PYTHON_VERSION} && \
   LIBS="$LIBS -lutil -lrt" ./configure --prefix=/var/lang && \
   make -j$(getconf _NPROCESSORS_ONLN) libinstall libainstall inclinstall && \
   cd .. && \
-  rm -rf Python-3.6.8
+  rm -rf Python-${PYTHON_VERSION}
 
 # Add these as a separate layer as they get updated frequently
 RUN pip install -U pip setuptools --no-cache-dir && \
   pip install -U virtualenv pipenv --no-cache-dir && \
-  pip install -U awscli boto3 aws-sam-cli==0.18.0 aws-lambda-builders==0.3.0 --no-cache-dir
+  curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/1.0.5/get-poetry.py | POETRY_VERSION=1.0.5 python3 && \
+  pip install -U awscli boto3 aws-sam-cli==0.48.0 aws-lambda-builders==0.8.0 --no-cache-dir
+
+ENV PATH=/root/.poetry/bin:$PATH

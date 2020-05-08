@@ -1,3 +1,5 @@
+FROM justinram11/lambda:provided
+
 FROM justinram11/lambda-base
 
 ENV PATH=/var/lang/bin:$PATH \
@@ -8,7 +10,9 @@ RUN rm -rf /var/runtime /var/lang && \
   curl https://lambci.s3.amazonaws.com/fs/python3.6.tgz | tar -zx -C /
 
 RUN rm /var/runtime/awslambda/runtime.cpython-36m-x86_64-linux-gnu.so
-COPY runtime-mock.py /var/runtime/awslambda/runtime.py
+COPY runtime_mock.py /var/runtime/awslambda/runtime.py
+
+COPY --from=0 /var/runtime/init /var/runtime/mockserver
 
 USER sbx_user1051
 

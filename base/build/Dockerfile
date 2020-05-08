@@ -14,7 +14,7 @@ yum_conf.write(f); \
 f.close();" && \
   rpm --rebuilddb && \
   yum install -y yum-plugin-ovl && \
-  yum reinstall -y setup pam shadow-utils audit-libs && \
+  yum reinstall -y setup pam shadow-utils audit-libs openssl glibc-common glibc && \
   yum groupinstall -y development && \
   yum install -y clang cmake docker python27-devel python36-devel \
     ImageMagick-devel cairo-devel libssh2-devel libxslt-devel libmpc-devel readline-devel db4-devel \
@@ -22,5 +22,6 @@ f.close();" && \
   alternatives --set gcc /usr/bin/gcc48 && \
   alternatives --set g++ /usr/bin/g++48 && \
   alternatives --set cpp /usr/bin/cpp48 && \
+  curl --silent --show-error --retry 5 https://bootstrap.pypa.io/get-pip.py | python3 && \
   yum clean all && \
   rm -rf /var/cache/yum
